@@ -26,6 +26,7 @@ export default function Home() {
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const [mounted, setMounted] = useState(false)
+  const [bankBalance, setBankBalance] = useState<string>('')
 
   // Wagmi hooks
   const { address, isConnected } = useAccount()
@@ -137,6 +138,26 @@ export default function Home() {
     throw new Error('No available nonce found')
   }
 
+  // get bank balance
+  const fetchBankBalance = async () => {
+    try {
+      if (!publicClient || !address) return
+
+      const balance = await publicClient.readContract({
+        address: BANK_ADDRESS,
+        abi: TokenBankABI,
+        functionName: 'getBalance'
+      })
+
+      // format balance
+      const formattedBalance = (Number(balance) / 1e18).toString()
+      setBankBalance(formattedBalance)
+    } catch (err: any) {
+      console.error('Error fetching balance:', err)
+      setError('Failed to fetch balance')
+    }
+  }
+
   if (!mounted) {
     return null
   }
@@ -156,7 +177,24 @@ export default function Home() {
         ) : (
           <div className="space-y-4">
             <p>Connected: {address}</p>
+            
+            {/* check bank balance */}
+            <div className="flex items-center space-x-4">
+              <button
+                onClick={fetchBankBalance}
+                className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+              >
+                Check Balance
+              </button>
+              {bankBalance && (
+                <p className="text-lg">
+                  Bank Balance: {bankBalance} Tokens
+                </p>
+              )}
+            </div>
+
             <div>
+              {/* deposit */}
               <input
                 type="number"
                 value={amount}
