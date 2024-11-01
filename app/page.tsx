@@ -14,6 +14,7 @@ import {
 } from 'wagmi'
 import { injected } from 'wagmi/connectors'
 import { parseEther, type Hash, type Address } from 'viem'
+import { keccak256, encodeAbiParameters, concat } from 'viem'
 
 export default function Home() {
   // Contract addresses
@@ -30,6 +31,9 @@ export default function Home() {
   const [bankBalance, setBankBalance] = useState<string>('')
   const [isApproving, setIsApproving] = useState(false)
   const [approveSuccess, setApproveSuccess] = useState(false)
+  const [supportsEIP2612, setSupportsEIP2612] = useState<boolean | null>(null)
+  const [isCheckingSupport, setIsCheckingSupport] = useState(false)
+  const [tokenBalance, setTokenBalance] = useState<string>('')
 
   // Wagmi hooks
   const { address, isConnected } = useAccount()
@@ -152,7 +156,13 @@ export default function Home() {
       // Wait for transaction
       await publicClient.waitForTransactionReceipt({ hash })
 
-      setSuccess('Deposit successful!')
+      setSuccess('Deposit with Permit2 successful!')
+
+      // fetch balances
+      await Promise.all([
+        fetchBankBalance(),
+        fetchTokenBalance(), // refresh token balance
+      ])
     } catch (err: any) {
       console.error('Error:', err)
       setError(err.message)
@@ -191,6 +201,227 @@ export default function Home() {
     }
   }
 
+  // check if the token supports EIP2612
+  const checkEIP2612Support = async (
+    contractAddress: Address
+  ): Promise<boolean> => {
+    if (!publicClient) return false
+    setIsCheckingSupport(true)
+    try {
+      await publicClient.readContract({
+        address: contractAddress,
+        abi: [
+          {
+            inputs: [],
+            name: 'DOMAIN_SEPARATOR',
+            outputs: [{ type: 'bytes32', name: '' }],
+            stateMutability: 'view',
+            type: 'function',
+          },
+        ],
+        functionName: 'DOMAIN_SEPARATOR',
+      })
+      setSupportsEIP2612(true)
+      return true
+    } catch {
+      setSupportsEIP2612(false)
+      return false
+    } finally {
+      setIsCheckingSupport(false)
+    }
+  }
+
+  // check if the token supports EIP2612 after connecting wallet
+  useEffect(() => {
+    if (isConnected && publicClient) {
+      checkEIP2612Support(TOKEN_ADDRESS)
+    }
+  }, [isConnected, publicClient])
+
+  // deposit function, choose different deposit methods based on token type
+  const handleDeposit = async () => {
+    try {
+      setLoading(true)
+      setError('')
+
+      if (!walletClient || !address) throw new Error('Wallet not connected')
+      if (!publicClient) throw new Error('Public client not available')
+
+      const amountWei = parseEther(amount)
+
+      // check if the token supports EIP2612
+      const supportsEIP2612 = await checkEIP2612Support(TOKEN_ADDRESS)
+
+      if (supportsEIP2612) {
+        // use permitDeposit
+        const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
+
+        // get signature
+        const { v, r, s } = await getEIP2612Signature(
+          address,
+          BANK_ADDRESS,
+          amountWei,
+          deadline
+        )
+
+        // call permitDeposit
+        const hash = await walletClient.writeContract({
+          address: BANK_ADDRESS,
+          abi: TokenBankABI,
+          functionName: 'permitDeposit',
+          args: [amountWei, deadline, v, r, s],
+        })
+
+        await publicClient.waitForTransactionReceipt({ hash })
+      } else {
+        // use permit2
+        await handleDepositWithPermit2()
+      }
+
+      setSuccess('Deposit successful!')
+    } catch (err: any) {
+      console.error('Error:', err)
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // get EIP2612 signature
+  const getEIP2612Signature = async (
+    owner: Address,
+    spender: Address,
+    amount: bigint,
+    deadline: bigint
+  ) => {
+    if (!walletClient || !publicClient) throw new Error('Wallet not connected')
+
+    const nonce = (await publicClient.readContract({
+      address: TOKEN_ADDRESS,
+      abi: ERC20ABI,
+      functionName: 'nonces',
+      args: [owner],
+    })) as bigint
+
+    // build EIP-712 data
+    const domain = {
+      name: await publicClient.readContract({
+        address: TOKEN_ADDRESS,
+        abi: ERC20ABI,
+        functionName: 'name',
+      }),
+      version: '1',
+      chainId,
+      verifyingContract: TOKEN_ADDRESS,
+    }
+
+    const types = {
+      Permit: [
+        { name: 'owner', type: 'address' },
+        { name: 'spender', type: 'address' },
+        { name: 'value', type: 'uint256' },
+        { name: 'nonce', type: 'uint256' },
+        { name: 'deadline', type: 'uint256' },
+      ],
+    }
+
+    const value = {
+      owner,
+      spender,
+      value: amount,
+      nonce,
+      deadline,
+    }
+
+    // use signTypedData to sign the data
+    const signature = await walletClient.signTypedData({
+      domain: domain as any,
+      types,
+      primaryType: 'Permit',
+      message: value,
+    })
+
+    // decompose the signature into v, r, s
+    const r = `0x${signature.slice(2, 66)}`
+    const s = `0x${signature.slice(66, 130)}`
+    const v = parseInt(signature.slice(130, 132), 16)
+
+    return { v, r: r as `0x${string}`, s: s as `0x${string}` }
+  }
+
+  // handle permitDeposit
+  const handlePermitDeposit = async () => {
+    try {
+      setLoading(true)
+      setError('')
+      setSuccess('')
+
+      if (!walletClient || !address) throw new Error('Wallet not connected')
+      if (!publicClient) throw new Error('Public client not available')
+
+      const amountWei = parseEther(amount)
+      const deadline = BigInt(Math.floor(Date.now() / 1000) + 3600)
+
+      // get signature
+      const { v, r, s } = await getEIP2612Signature(
+        address,
+        BANK_ADDRESS,
+        amountWei,
+        deadline
+      )
+
+      // call permitDeposit
+      const hash = await walletClient.writeContract({
+        address: BANK_ADDRESS,
+        abi: TokenBankABI,
+        functionName: 'permitDeposit',
+        args: [amountWei, deadline, v, r, s],
+      })
+
+      await publicClient.waitForTransactionReceipt({ hash })
+      setSuccess('Deposit with EIP2612 successful!')
+
+      // fetch balances
+      await Promise.all([
+        fetchBankBalance(),
+        fetchTokenBalance(), // refresh token balance
+      ])
+    } catch (err: any) {
+      console.error('Error:', err)
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  // fetch token balance
+  const fetchTokenBalance = async () => {
+    try {
+      if (!publicClient || !address) return
+
+      const balance = await publicClient.readContract({
+        address: TOKEN_ADDRESS,
+        abi: ERC20ABI,
+        functionName: 'balanceOf',
+        args: [address],
+      })
+
+      // format balance
+      const formattedBalance = (Number(balance) / 1e18).toString()
+      setTokenBalance(formattedBalance)
+    } catch (err: any) {
+      console.error('Error fetching token balance:', err)
+      setError('Failed to fetch token balance')
+    }
+  }
+
+  // fetch token balance after connecting wallet
+  useEffect(() => {
+    if (isConnected && publicClient) {
+      fetchTokenBalance()
+    }
+  }, [isConnected, publicClient])
+
   if (!mounted) {
     return null
   }
@@ -211,28 +442,41 @@ export default function Home() {
           <div className="space-y-4">
             <p>Connected: {address}</p>
 
-            {/* check bank balance */}
+            {/* Token Balance with Refresh Button */}
             <div className="flex items-center space-x-4">
+              <p className="text-lg">Your token balance: {tokenBalance} Tokens</p>
               <button
-                onClick={fetchBankBalance}
-                className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+                onClick={() =>
+                  Promise.all([fetchTokenBalance(), fetchBankBalance()])
+                }
+                className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-1 px-2 rounded text-sm"
               >
-                Check Balance
+                🔄 Refresh Balances
               </button>
-              {bankBalance && (
-                <p className="text-lg">Bank Balance: {bankBalance} Tokens</p>
-              )}
             </div>
 
-            <div>
-              {/* deposit */}
+            {/* Amount Input */}
+            <div className="mb-4">
               <input
                 type="number"
                 value={amount}
-                onChange={(e) => setAmount(e.target.value)}
-                placeholder="Amount to deposit"
+                onChange={(e) => {
+                  // input validation
+                  const value = e.target.value
+                  if (Number(value) > Number(tokenBalance)) {
+                    setError('Amount exceeds balance')
+                  } else {
+                    setError('')
+                  }
+                  setAmount(value)
+                }}
+                placeholder="Amount of tokens to deposit"
                 className="border p-2 rounded mr-2 bg-gray-800 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
               />
+            </div>
+
+            {/* Deposit Buttons */}
+            <div className="space-x-4">
               <button
                 onClick={handleDepositWithPermit2}
                 disabled={loading || isApproving}
@@ -244,8 +488,19 @@ export default function Home() {
                     ? 'Processing...'
                     : 'Deposit with Permit2'}
               </button>
+
+              {supportsEIP2612 && (
+                <button
+                  onClick={handlePermitDeposit}
+                  disabled={loading}
+                  className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+                >
+                  {loading ? 'Processing...' : 'Deposit with EIP2612'}
+                </button>
+              )}
             </div>
 
+            {/* Status Messages */}
             {isApproving && (
               <p className="text-yellow-500">
                 Approving Permit2 for first-time use...
@@ -254,9 +509,22 @@ export default function Home() {
             {approveSuccess && (
               <p className="text-green-500">Successfully approved Permit2!</p>
             )}
-
             {error && <p className="text-red-500">{error}</p>}
             {success && <p className="text-green-500">{success}</p>}
+
+            {/* Balance Check */}
+            <div className="flex items-center space-x-4 mt-4">
+              <button
+                onClick={fetchBankBalance}
+                className="bg-purple-500 hover:bg-purple-700 text-white font-bold py-2 px-4 rounded"
+              >
+                Check Balance
+              </button>
+              {bankBalance && (
+                <p className="text-lg">Bank Balance: {bankBalance} Tokens</p>
+              )}
+            </div>
+
             <button
               onClick={() => disconnect()}
               className="bg-red-500 hover:bg-red-700 text-white font-bold py-2 px-4 rounded"
